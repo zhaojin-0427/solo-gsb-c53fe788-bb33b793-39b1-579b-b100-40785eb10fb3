@@ -1,8 +1,11 @@
 """请求/响应模型（Pydantic v2）。
 
 场景一旦保存即不可变：仅提供创建与读取接口，无更新/删除接口。
+整定批次同样不可变：发布后只能追加新版本，不能修改或删除既有批次。
 """
 from __future__ import annotations
+
+from typing import Annotated
 
 from pydantic import BaseModel, ConfigDict, Field, FiniteFloat, model_validator
 
@@ -220,4 +223,101 @@ class CoordinationPlanOut(BaseModel):
     )
     reasons: InfeasibleReasonsOut | None = Field(
         default=None, description="无解原因分类（有解时为 null）"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 多场景整定发布（批次）模型
+# ---------------------------------------------------------------------------
+# 倍率一律为有限正数（0、负数、inf、nan 均拒绝）。
+PositiveFiniteFloat = Annotated[FiniteFloat, Field(gt=0)]
+
+
+class ScenarioTuningIn(BaseModel):
+    """单个场景的整定项：场景 ID、所依据的期望版本与断路器倍率映射。
+
+    expected_revision 为客户端所依据的该场景当前整定版本（初次整定填 0）；
+    multipliers 仅列出非默认断路器，未列出者倍率取 1。
+    """
+
+    scenario_id: str = Field(min_length=1)
+    expected_revision: int = Field(
+        ge=0, description="所依据的当前整定版本（乐观锁；初次整定为 0）"
+    )
+    multipliers: dict[str, PositiveFiniteFloat] = Field(
+        default_factory=dict,
+        description="断路器 ID -> 有限正倍率；未列出者取 1",
+    )
+
+
+class TuningBatchIn(BaseModel):
+    """多场景整定发布请求：同一 request_id 的重试幂等回放。
+
+    至少包含两个场景项；同内容重试（含排序差异）回放原批次，异文冲突。
+    """
+
+    request_id: str = Field(min_length=1, description="客户端幂等键")
+    scenarios: list[ScenarioTuningIn] = Field(min_length=2)
+
+
+class TuningMultiplierOut(BaseModel):
+    """生效倍率表中的一台断路器。"""
+
+    breaker_id: str
+    k: float = Field(description="生效倍率（有限正数；未列出的断路器倍率为 1）")
+
+
+class ScenarioTuningItemOut(BaseModel):
+    """批次中单个场景的生效结果。"""
+
+    scenario_id: str
+    expected_revision: int = Field(description="提交时客户端所依据的版本")
+    revision: int = Field(description="该场景在本批次生效后的整定版本（从 1 起递增）")
+    multipliers: list[TuningMultiplierOut] = Field(
+        default_factory=list,
+        description="提交的非默认倍率（按断路器 ID 排序；未列出者倍率为 1）",
+    )
+    verification: VerifyResponseOut = Field(
+        description="按本批次倍率核验的结果（与倍率同版本，不混合）"
+    )
+
+
+class TuningBatchOut(BaseModel):
+    """一个不可变整定批次的完整视图。"""
+
+    request_id: str
+    replayed: bool = Field(
+        description="false=本次请求新建批次（201）；true=同内容重试回放既有批次（200）"
+    )
+    created_at: str
+    scenarios: list[ScenarioTuningItemOut] = Field(
+        description="各场景生效项（按场景 ID 排序）"
+    )
+
+
+class TuningBatchSummary(BaseModel):
+    """整定批次摘要（列表用）。"""
+
+    request_id: str
+    created_at: str
+    scenario_count: int
+
+
+class ScenarioTuningStateOut(BaseModel):
+    """单个场景在某一整定版本下的生效状态（单次读取不混合版本）。"""
+
+    scenario_id: str
+    revision: int = Field(description="整定版本；0 表示尚无批次生效（倍率全为 1）")
+    batch_request_id: str | None = Field(
+        default=None, description="产生该版本的批次 request_id；版本 0 时为 null"
+    )
+    created_at: str | None = Field(
+        default=None, description="该版本批次的创建时间；版本 0 时为 null"
+    )
+    multipliers: list[TuningMultiplierOut] = Field(
+        default_factory=list,
+        description="该版本提交的非默认倍率（按断路器 ID 排序；未列出者为 1）",
+    )
+    verification: VerifyResponseOut = Field(
+        description="该版本倍率对应的核验结果（与倍率同版本，不混合）"
     )

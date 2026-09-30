@@ -1,0 +1,7 @@
+{
+  "request_id": "batch-2026-09-30-001",
+  "scenarios": [
+    {"scenario_id": "<idA>", "expected_revision": 0, "multipliers": {"CB1": 1.5}},
+    {"scenario_id": "<idB>", "expected_revision": 0, "multipliers": {"CB1": 1.5}}
+  ]
+}

@@ -1,0 +1,30 @@
+{
+  "name": "tuning-demo-b",
+  "source": "S",
+  "branches": [
+    {"id": "L1", "from": "S", "to": "A", "breaker": {"id": "CB1", "curve_id": "C_UP"}},
+    {"id": "L2", "from": "A", "to": "B", "breaker": {"id": "CB3", "curve_id": "C_MAIN"}},
+    {"id": "L3", "from": "B", "to": "C"}
+  ],
+  "curves": [
+    {
+      "id": "C_MAIN",
+      "points": [
+        {"current": 10, "time": 10},
+        {"current": 100, "time": 1},
+        {"current": 1000, "time": 0.1}
+      ]
+    },
+    {
+      "id": "C_UP",
+      "points": [
+        {"current": 10, "time": 20},
+        {"current": 100, "time": 1.5},
+        {"current": 1000, "time": 0.12}
+      ]
+    }
+  ],
+  "faults": [
+    {"id": "J1", "branch_id": "L3", "current_min": 10, "current_max": 1000, "r": 1.8}
+  ]
+}
