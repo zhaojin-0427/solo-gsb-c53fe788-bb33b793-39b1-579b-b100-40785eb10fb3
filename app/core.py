@@ -24,6 +24,7 @@ from .schemas import (
     InfeasibleReasonsOut,
     PairResultOut,
     ScenarioIn,
+    SettingBatchIn,
     UnadjustedPairViolationOut,
     VerifyResponseOut,
     VerifySummaryOut,
@@ -560,3 +561,114 @@ def build_coordination_plan(
         ],
         verification=verify_scenario(scenario_id, scenario, ln_k),
     )
+
+
+# ---------------------------------------------------------------------------
+# 多场景整定发布
+# ---------------------------------------------------------------------------
+
+def known_breaker_ids(scenario: ScenarioIn) -> set[str]:
+    """场景内全部断路器 ID。"""
+    return {b.breaker.id for b in scenario.branches if b.breaker is not None}
+
+
+def _multiplier_out(multipliers: dict[str, float]) -> list[BreakerMultiplierOut]:
+    """倍率映射 -> 按断路器 ID 排序的输出（未列出者 k=1 不在此列）。"""
+    return [
+        BreakerMultiplierOut(breaker_id=bid, k=float(k), ln_k=math.log(k))
+        for bid, k in sorted(multipliers.items())
+    ]
+
+
+def prepare_setting_batch(
+    request: SettingBatchIn,
+    scenarios: dict[str, ScenarioIn],
+) -> list[dict]:
+    """发布前的整批核验：通过则返回各场景可落库的冻结结果，失败抛 DomainError(422)。
+
+    核验规则：
+    - 场景项不得重复（同 scenario_id 出现多次 -> 422）；
+    - 倍率映射中的断路器必须存在于对应场景（未知断路器 -> 422）；
+    - 同一断路器 ID 跨场景视为同一台设备，显式给出的倍率必须相同
+      （冲突 -> 422）；未列出者统一取 1；
+    - 每个场景的故障集非空、全部故障均有主保护且施加倍率后全部合格，
+      否则整批拒绝（空故障集 / 无保护 / 任一故障不合格 -> 422）。
+    """
+    errors: list[str] = []
+
+    # --- 重复场景 ---
+    seen_scenarios: set[str] = set()
+    for item in request.scenarios:
+        if item.scenario_id in seen_scenarios:
+            errors.append(f"批次内场景重复: {item.scenario_id!r}")
+        seen_scenarios.add(item.scenario_id)
+
+    # --- 未知断路器 + 跨场景同 ID 倍率一致性 ---
+    device_k: dict[str, float] = {}
+    for item in request.scenarios:
+        scenario = scenarios.get(item.scenario_id)
+        if scenario is None:
+            errors.append(f"场景不存在: {item.scenario_id!r}")
+            continue
+        known = known_breaker_ids(scenario)
+        for bid, k in item.multipliers.items():
+            if bid not in known:
+                errors.append(
+                    f"场景 {item.scenario_id!r} 中的断路器不存在: {bid!r}"
+                )
+                continue
+            prev = device_k.get(bid)
+            if prev is not None and prev != k:
+                errors.append(
+                    f"断路器 {bid!r} 跨场景倍率不一致: 同一设备在不同场景中"
+                    f"必须相同（{prev} 与 {k}）"
+                )
+            else:
+                device_k.setdefault(bid, k)
+    if errors:
+        raise DomainError(errors)
+
+    # --- 逐场景核验：空故障集 / 无保护 / 不合格均整批拒绝 ---
+    items: list[dict] = []
+    for item in sorted(request.scenarios, key=lambda s: s.scenario_id):
+        scenario = scenarios[item.scenario_id]
+        if not scenario.faults:
+            errors.append(
+                f"场景 {item.scenario_id!r} 的故障集合为空，无法整定"
+            )
+            continue
+        ln_k = {bid: math.log(k) for bid, k in item.multipliers.items()}
+        curves = {
+            c.id: Curve.from_points(c.id, c.points) for c in scenario.curves
+        }
+        unprotected: list[str] = []
+        unqualified: list[str] = []
+        for fault in scenario.faults:
+            report = evaluate_fault(scenario, fault, curves, ln_k)
+            if report.status == "unprotected":
+                unprotected.append(fault.id)
+            elif report.status == "unqualified":
+                unqualified.append(fault.id)
+        if unprotected:
+            errors.append(
+                f"场景 {item.scenario_id!r} 存在无保护故障，整批拒绝: "
+                f"{unprotected}"
+            )
+        if unqualified:
+            errors.append(
+                f"场景 {item.scenario_id!r} 提交倍率核验不合格，整批拒绝: "
+                f"故障 {unqualified}"
+            )
+        items.append(
+            {
+                "scenario_id": item.scenario_id,
+                "expected_revision": item.expected_revision,
+                "multipliers": _multiplier_out(item.multipliers),
+                "verification": verify_scenario(
+                    item.scenario_id, scenario, ln_k
+                ),
+            }
+        )
+    if errors:
+        raise DomainError(errors)
+    return items

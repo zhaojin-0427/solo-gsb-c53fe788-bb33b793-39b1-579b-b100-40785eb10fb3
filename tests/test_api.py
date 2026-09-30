@@ -3,6 +3,9 @@ from __future__ import annotations
 
 import copy
 import math
+import os
+import subprocess
+import sys
 
 import pytest
 from fastapi.testclient import TestClient
@@ -713,3 +716,424 @@ def test_coordination_plan_degenerate_interval(client):
     f1 = next(f for f in body["verification"]["faults"] if f["fault_id"] == "F1")
     assert f1["status"] == "qualified"
     assert f1["pairs"][0]["min_ratio"] == pytest.approx(1.8, rel=1e-9)
+
+
+# ---------------------------------------------------------------------------
+# 多场景整定发布（POST /setting-batches）
+# ---------------------------------------------------------------------------
+
+def setting_payload(sid_a: str, sid_b: str, request_id: str = "req-1",
+                    k_a=1.5, k_b=1.5, rev_a=0, rev_b=0) -> dict:
+    """两个场景、同一设备 CB1 同倍率的合格批次（F1 原始最小比值 1.2，
+    乘以 k_CB1=1.5 后恰为 1.8 等号合格）。"""
+    return {
+        "request_id": request_id,
+        "scenarios": [
+            {"scenario_id": sid_a, "expected_revision": rev_a,
+             "multipliers": {"CB1": k_a}},
+            {"scenario_id": sid_b, "expected_revision": rev_b,
+             "multipliers": {"CB1": k_b}},
+        ],
+    }
+
+
+def two_coordination_scenarios(client: TestClient) -> tuple[str, str]:
+    """创建两个结构相同、相互独立的协调场景（均只含有保护故障 F1–F4）。"""
+    payload = coord_payload()
+    sid_a = create_ok(client, payload)
+    payload_b = copy.deepcopy(payload)
+    payload_b["name"] = "coordination-demo-b"
+    sid_b = create_ok(client, payload_b)
+    return sid_a, sid_b
+
+
+def test_setting_batch_publish_and_read_back(client):
+    sid_a, sid_b = two_coordination_scenarios(client)
+
+    # 发布前：生效版本 0，全部倍率 1，核验按场景原文（F1 不合格）
+    eff0 = client.get(f"/scenarios/{sid_a}/effective-setting").json()
+    assert eff0["revision"] == 0 and eff0["batch_id"] is None
+    assert eff0["multipliers"] == []
+    f1 = next(f for f in eff0["verification"]["faults"] if f["fault_id"] == "F1")
+    assert f1["status"] == "unqualified"
+
+    resp = client.post(
+        "/setting-batches", json=setting_payload(sid_a, sid_b))
+    assert resp.status_code == 201, resp.text
+    batch = resp.json()
+    assert batch["replayed"] is False
+    assert batch["seq"] == 1
+    assert len(batch["scenarios"]) == 2
+    by_sid = {s["scenario_id"]: s for s in batch["scenarios"]}
+    for sid in (sid_a, sid_b):
+        item = by_sid[sid]
+        assert (item["expected_revision"], item["from_revision"],
+                item["to_revision"]) == (0, 0, 1)
+        assert [m["breaker_id"] for m in item["multipliers"]] == ["CB1"]
+        assert item["multipliers"][0]["k"] == pytest.approx(1.5)
+        f1 = next(f for f in item["verification"]["faults"]
+                  if f["fault_id"] == "F1")
+        assert f1["status"] == "qualified"
+        assert f1["pairs"][0]["min_ratio"] == pytest.approx(1.8, rel=1e-9)
+
+    # 发布后当前生效：版本 1，倍率 CB1=1.5，与冻结核验同源
+    eff1 = client.get(f"/scenarios/{sid_a}/effective-setting").json()
+    assert eff1["revision"] == 1
+    assert eff1["batch_id"] == batch["id"]
+    assert eff1["multipliers"][0]["k"] == pytest.approx(1.5)
+    assert eff1["verification"] == by_sid[sid_a]["verification"]
+
+    # 单次读取不混合版本：版本 0 仍是历史原文核验
+    hist0 = client.get(
+        f"/scenarios/{sid_a}/effective-setting?revision=0").json()
+    assert hist0["revision"] == 0 and hist0["batch_id"] is None
+    assert hist0["multipliers"] == []
+    assert hist0["verification"]["faults"][0]["status"] == "unqualified"
+
+    # 版本历史、批次列表、按 request_id 查询
+    revs = client.get(f"/scenarios/{sid_a}/revisions").json()["revisions"]
+    assert revs == [
+        {"revision": 1, "batch_id": batch["id"], "from_revision": 0}]
+    listing = client.get("/setting-batches").json()
+    assert [b["id"] for b in listing] == [batch["id"]]
+    assert listing[0]["scenario_count"] == 2
+    by_req = client.get(f"/setting-batches/by-request/{batch['request_id']}")
+    assert by_req.status_code == 200 and by_req.json()["id"] == batch["id"]
+    assert client.get("/setting-batches/nope").status_code == 404
+    assert client.get("/setting-batches/by-request/nope").status_code == 404
+    # 尚未产生的未来版本 -> 404
+    assert client.get(
+        f"/scenarios/{sid_a}/effective-setting?revision=9").status_code == 404
+
+
+def test_setting_batch_requires_at_least_two_scenarios(client):
+    sid, _ = two_coordination_scenarios(client)
+    resp = client.post("/setting-batches", json={
+        "request_id": "x",
+        "scenarios": [
+            {"scenario_id": sid, "expected_revision": 0, "multipliers": {}},
+        ],
+    })
+    assert resp.status_code == 422
+
+
+def test_setting_batch_duplicate_scenario_422(client):
+    sid, _ = two_coordination_scenarios(client)
+    resp = client.post("/setting-batches", json={
+        "request_id": "x",
+        "scenarios": [
+            {"scenario_id": sid, "expected_revision": 0,
+             "multipliers": {"CB1": 1.5}},
+            {"scenario_id": sid, "expected_revision": 0,
+             "multipliers": {"CB1": 1.5}},
+        ],
+    })
+    assert resp.status_code == 422 and "场景重复" in resp.text
+
+
+def test_setting_batch_unknown_scenario_and_breaker_422(client):
+    sid, sid_b = two_coordination_scenarios(client)
+    resp = client.post("/setting-batches", json={
+        "request_id": "x",
+        "scenarios": [
+            {"scenario_id": sid, "expected_revision": 0,
+             "multipliers": {"CB_GHOST": 1.0}},
+            {"scenario_id": "deadbeef", "expected_revision": 0,
+             "multipliers": {}},
+        ],
+    })
+    assert resp.status_code == 422
+    assert "断路器不存在" in resp.text
+    assert "场景不存在" in resp.text
+
+
+def test_setting_batch_same_device_must_have_same_k(client):
+    sid_a, sid_b = two_coordination_scenarios(client)
+    # CB1 跨场景倍率不同（即使各自核验都合格）-> 422
+    resp = client.post(
+        "/setting-batches", json=setting_payload(sid_a, sid_b, "x", 1.5, 2.0))
+    assert resp.status_code == 422 and "跨场景倍率不一致" in resp.text
+
+
+def test_setting_batch_invalid_multipliers_422(client):
+    sid_a, sid_b = two_coordination_scenarios(client)
+    base = setting_payload(sid_a, sid_b, "x")
+    base["scenarios"][0]["multipliers"]["CB1"] = 0
+    assert client.post("/setting-batches", json=base).status_code == 422
+    base = setting_payload(sid_a, sid_b, "x")
+    base["scenarios"][0]["multipliers"]["CB1"] = -1.5
+    assert client.post("/setting-batches", json=base).status_code == 422
+    base = setting_payload(sid_a, sid_b, "x")
+    base["scenarios"][0]["expected_revision"] = -1
+    assert client.post("/setting-batches", json=base).status_code == 422
+    # Infinity / NaN（JSON 字面量）-> 422，不能变成 500
+    raw = (
+        '{"request_id":"x","scenarios":['
+        f'{{"scenario_id":"{sid_a}","expected_revision":0,'
+        '"multipliers":{"CB1":Infinity}},'
+        f'{{"scenario_id":"{sid_b}","expected_revision":0,'
+        '"multipliers":{}}]}'
+    )
+    resp = client.post(
+        "/setting-batches", content=raw,
+        headers={"Content-Type": "application/json"})
+    assert resp.status_code == 422
+
+
+def test_setting_batch_unqualified_rejected(client):
+    # k 全 1：F1 最小比值 1.2 < 1.8，整批拒绝
+    sid_a, sid_b = two_coordination_scenarios(client)
+    payload = setting_payload(sid_a, sid_b, "x")
+    for s in payload["scenarios"]:
+        s["multipliers"] = {}
+    resp = client.post("/setting-batches", json=payload)
+    assert resp.status_code == 422 and "核验不合格" in resp.text
+
+    # 一个场景合格、另一个不合格 -> 同样整批拒绝（不能部分生效）
+    payload = setting_payload(sid_a, sid_b, "y", 1.5, 1.0)
+    resp = client.post("/setting-batches", json=payload)
+    assert resp.status_code == 422
+    # 两个场景版本都必须停留在 0
+    for sid in (sid_a, sid_b):
+        assert client.get(
+            f"/scenarios/{sid}/effective-setting").json()["revision"] == 0
+
+
+def test_setting_batch_empty_fault_set_422(client):
+    p = coord_payload()
+    p["faults"] = []
+    sid_empty = create_ok(client, p)
+    sid, _ = two_coordination_scenarios(client)
+    resp = client.post("/setting-batches", json={
+        "request_id": "x", "scenarios": [
+            {"scenario_id": sid, "expected_revision": 0,
+             "multipliers": {"CB1": 1.5}},
+            {"scenario_id": sid_empty, "expected_revision": 0,
+             "multipliers": {}},
+        ]})
+    assert resp.status_code == 422 and "故障集合为空" in resp.text
+
+
+def test_setting_batch_unprotected_422(client):
+    sid, _ = two_coordination_scenarios(client)
+    sid_u = create_ok(client, base_payload())  # 含无保护故障 F5
+    resp = client.post("/setting-batches", json={
+        "request_id": "x", "scenarios": [
+            {"scenario_id": sid, "expected_revision": 0,
+             "multipliers": {"CB1": 1.5}},
+            {"scenario_id": sid_u, "expected_revision": 0,
+             "multipliers": {"CB1": 1.5}},
+        ]})
+    assert resp.status_code == 422 and "无保护故障" in resp.text
+
+
+def test_setting_batch_revision_conflict_409_and_no_partial(client):
+    sid_a, sid_b = two_coordination_scenarios(client)
+    # 第一批成功：两场景 0 -> 1
+    first = client.post(
+        "/setting-batches", json=setting_payload(sid_a, sid_b, "req-1"))
+    assert first.status_code == 201
+    # 第二批仍声明 expected_revision=0 -> 409，版本不得继续推进
+    resp = client.post(
+        "/setting-batches", json=setting_payload(sid_a, sid_b, "req-2"))
+    assert resp.status_code == 409
+    body = resp.json()
+    assert {c["scenario_id"] for c in body["conflicts"]} == {sid_a, sid_b}
+    assert all(c["expected_revision"] == 0 and c["current_revision"] == 1
+               for c in body["conflicts"])
+    for sid in (sid_a, sid_b):
+        assert client.get(
+            f"/scenarios/{sid}/effective-setting").json()["revision"] == 1
+    # 只有一个批次
+    assert len(client.get("/setting-batches").json()) == 1
+
+
+def test_setting_batch_second_wave_with_correct_revision(client):
+    sid_a, sid_b = two_coordination_scenarios(client)
+    client.post(
+        "/setting-batches", json=setting_payload(sid_a, sid_b, "req-1"))
+    # 带上新版本号 1 再发一批（CB2 同时降速，保持合格），两场景 1 -> 2
+    payload = {
+        "request_id": "req-2",
+        "scenarios": [
+            {"scenario_id": sid_a, "expected_revision": 1,
+             "multipliers": {"CB1": 1.5}},
+            {"scenario_id": sid_b, "expected_revision": 1,
+             "multipliers": {"CB1": 1.5}},
+        ],
+    }
+    resp = client.post("/setting-batches", json=payload)
+    assert resp.status_code == 201, resp.text
+    batch2 = resp.json()
+    assert {s["to_revision"] for s in batch2["scenarios"]} == {2}
+    eff = client.get(f"/scenarios/{sid_a}/effective-setting").json()
+    assert eff["revision"] == 2 and eff["batch_id"] == batch2["id"]
+    # 历史版本 1 仍可读取且与第一批次冻结内容一致
+    hist1 = client.get(
+        f"/scenarios/{sid_a}/effective-setting?revision=1").json()
+    assert hist1["batch_id"] != batch2["id"]
+    assert [b["seq"] for b in client.get("/setting-batches").json()] == [1, 2]
+
+
+def test_setting_batch_idempotent_replay_before_version_check(client):
+    sid_a, sid_b = two_coordination_scenarios(client)
+    payload = setting_payload(sid_a, sid_b, "idem-1")
+    first = client.post("/setting-batches", json=payload)
+    assert first.status_code == 201
+    batch = first.json()
+
+    # 同内容重试（场景顺序打乱）：即便 expected_revision 已过期，
+    # 也先于版本检查回放原批次 -> 200 + replayed=true，不产生新批次
+    payload_retry = {
+        "request_id": "idem-1",
+        "scenarios": list(reversed(payload["scenarios"])),
+    }
+    retry = client.post("/setting-batches", json=payload_retry)
+    assert retry.status_code == 200
+    rj = retry.json()
+    assert rj["id"] == batch["id"] and rj["replayed"] is True
+    # 各场景项仍按 scenario_id 规范化排序
+    assert [s["scenario_id"] for s in rj["scenarios"]] == sorted(
+        s["scenario_id"] for s in rj["scenarios"])
+    assert len(client.get("/setting-batches").json()) == 1
+
+    # 同 request_id 异文（两边一致地改成另一个倍率）-> 409
+    divergent = setting_payload(sid_a, sid_b, "idem-1", 2.0, 2.0)
+    resp = client.post("/setting-batches", json=divergent)
+    assert resp.status_code == 409
+    assert resp.json()["existing_batch_id"] == batch["id"]
+    # 异文不得产生新批次，原批次仍可回放
+    assert client.post(
+        "/setting-batches", json=payload).json()["id"] == batch["id"]
+
+
+def test_setting_batch_unlisted_breakers_default_to_one(client):
+    # CB1=2.0 单独施加也合格；只列 CB1 时 CB2 隐式为 1
+    sid_a, sid_b = two_coordination_scenarios(client)
+    payload = setting_payload(sid_a, sid_b, "req-k", 2.0, 2.0)
+    batch = client.post("/setting-batches", json=payload).json()
+    for item in batch["scenarios"]:
+        assert [m["breaker_id"] for m in item["multipliers"]] == ["CB1"]
+    eff = client.get(f"/scenarios/{sid_a}/effective-setting").json()
+    # 生效倍率只回显非默认项；CB2 未列出即 k=1
+    assert [m["breaker_id"] for m in eff["multipliers"]] == ["CB1"]
+    f1 = next(f for f in eff["verification"]["faults"] if f["fault_id"] == "F1")
+    # 比值被整体抬到 1.2 * 2 = 2.4
+    assert f1["pairs"][0]["min_ratio"] == pytest.approx(2.4, rel=1e-9)
+
+
+def test_setting_batches_persist_across_restart(tmp_path):
+    db_file = str(tmp_path / "settings.db")
+    with TestClient(create_app(db_file)) as c1:
+        sid_a, sid_b = two_coordination_scenarios(c1)
+        batch = c1.post(
+            "/setting-batches", json=setting_payload(sid_a, sid_b, "persist")
+        ).json()
+        assert batch["seq"] == 1
+    # 重启后批次、版本、冻结倍率均可读
+    with TestClient(create_app(db_file)) as c2:
+        got = c2.get(f"/setting-batches/{batch['id']}")
+        assert got.status_code == 200 and got.json()["request_id"] == "persist"
+        assert c2.get(
+            f"/setting-batches/by-request/persist").json()["id"] == batch["id"]
+        eff = c2.get(f"/scenarios/{sid_a}/effective-setting").json()
+        assert eff["revision"] == 1 and eff["batch_id"] == batch["id"]
+        assert eff["multipliers"][0]["k"] == pytest.approx(1.5)
+        # 重启后同内容重试仍幂等回放
+        replay = c2.post(
+            "/setting-batches", json=setting_payload(sid_a, sid_b, "persist"))
+        assert replay.status_code == 200 and replay.json()["id"] == batch["id"]
+        # seq 不回退：新批次 seq=2
+        nxt = c2.post("/setting-batches",
+                      json=setting_payload(sid_a, sid_b, "persist-2",
+                                           rev_a=1, rev_b=1))
+        assert nxt.status_code == 201 and nxt.json()["seq"] == 2
+
+
+def test_setting_batch_cross_process_contention_only_one_wins(tmp_path):
+    """跨进程争用同一场景：多个独立进程以 expected_revision=0 并发提交，
+    恰有一批 201，其余 409；最终版本原子一致。"""
+    db_file = str(tmp_path / "contention.db")
+    with TestClient(create_app(db_file)) as setup:
+        sid_a, sid_b = two_coordination_scenarios(setup)
+
+    worker = (
+        "import sys, time, random\n"
+        "from fastapi.testclient import TestClient\n"
+        "from app.main import create_app\n"
+        "DB, S1, S2, RID = sys.argv[1:5]\n"
+        "time.sleep(0.2 + random.random()*0.3)\n"
+        "c = TestClient(create_app(DB))\n"
+        "body = {'request_id': RID, 'scenarios': [\n"
+        "  {'scenario_id': S1, 'expected_revision': 0,\n"
+        "   'multipliers': {'CB1': 1.5}},\n"
+        "  {'scenario_id': S2, 'expected_revision': 0,\n"
+        "   'multipliers': {'CB1': 1.5}}]}\n"
+        "r = c.post('/setting-batches', json=body)\n"
+        "print(r.status_code)\n"
+    )
+    env = {**os.environ, "PYTHONPATH": os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__)))}
+    procs = [
+        subprocess.Popen(
+            [sys.executable, "-c", worker, db_file, sid_a, sid_b, f"race-{i}"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+            env=env,
+        )
+        for i in range(4)
+    ]
+    codes = [int(p.stdout.read().strip()) for p in procs]
+    assert sorted(codes) == sorted([201, 409, 409, 409]), codes
+
+    with TestClient(create_app(db_file)) as check:
+        for sid in (sid_a, sid_b):
+            eff = check.get(f"/scenarios/{sid}/effective-setting").json()
+            assert eff["revision"] == 1
+            assert eff["multipliers"][0]["k"] == pytest.approx(1.5)
+            assert eff["verification"]["faults"][0]["status"] == "qualified"
+        assert len(check.get("/setting-batches").json()) == 1
+
+
+def test_setting_batch_cross_process_same_request_id_all_replay(tmp_path):
+    """4 个进程以相同 request_id 并发提交：恰有一个 201，其余 200 回放，
+    最终只存在一个批次（UNIQUE 竞态不得变成 500）。"""
+    db_file = str(tmp_path / "contention_idem.db")
+    with TestClient(create_app(db_file)) as setup:
+        sid_a, sid_b = two_coordination_scenarios(setup)
+
+    worker = (
+        "import sys, time, random\n"
+        "from fastapi.testclient import TestClient\n"
+        "from app.main import create_app\n"
+        "DB, S1, S2 = sys.argv[1:4]\n"
+        "time.sleep(0.2 + random.random()*0.3)\n"
+        "c = TestClient(create_app(DB))\n"
+        "body = {'request_id': 'same-id', 'scenarios': [\n"
+        "  {'scenario_id': S1, 'expected_revision': 0,\n"
+        "   'multipliers': {'CB1': 1.5}},\n"
+        "  {'scenario_id': S2, 'expected_revision': 0,\n"
+        "   'multipliers': {'CB1': 1.5}}]}\n"
+        "r = c.post('/setting-batches', json=body)\n"
+        "j = r.json()\n"
+        "print(r.status_code, j.get('id', ''))\n"
+    )
+    env = {**os.environ, "PYTHONPATH": os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__)))}
+    procs = [
+        subprocess.Popen(
+            [sys.executable, "-c", worker, db_file, sid_a, sid_b],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+            env=env,
+        )
+        for _ in range(4)
+    ]
+    lines = [p.stdout.read().strip().split() for p in procs]
+    codes = sorted(int(parts[0]) for parts in lines)
+    assert codes == sorted([201, 200, 200, 200]), codes
+    ids = {parts[1] for parts in lines if len(parts) > 1}
+    assert len(ids) == 1  # 全部指向同一个批次
+
+    with TestClient(create_app(db_file)) as check:
+        assert len(check.get("/setting-batches").json()) == 1
+        assert check.get(
+            "/setting-batches/by-request/same-id").status_code == 200

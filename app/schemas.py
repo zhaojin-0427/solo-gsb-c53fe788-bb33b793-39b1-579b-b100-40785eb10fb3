@@ -1,8 +1,11 @@
 """请求/响应模型（Pydantic v2）。
 
 场景一旦保存即不可变：仅提供创建与读取接口，无更新/删除接口。
+整定批次同样不可变：仅可发布与读取，发布后各场景的生效版本单调递增。
 """
 from __future__ import annotations
+
+from typing import Annotated
 
 from pydantic import BaseModel, ConfigDict, Field, FiniteFloat, model_validator
 
@@ -221,3 +224,91 @@ class CoordinationPlanOut(BaseModel):
     reasons: InfeasibleReasonsOut | None = Field(
         default=None, description="无解原因分类（有解时为 null）"
     )
+
+
+# ---------------------------------------------------------------------------
+# 多场景整定发布模型
+# ---------------------------------------------------------------------------
+
+# 有限正倍率（拒绝 0、负数、inf/nan）。
+PositiveFiniteFloat = Annotated[float, Field(gt=0), FiniteFloat]
+
+
+class ScenarioSettingIn(BaseModel):
+    """批次中单个场景的整定项：期望版本 + 断路器 ID 到正倍率的映射。"""
+
+    scenario_id: str = Field(min_length=1)
+    expected_revision: int = Field(
+        ge=0, description="客户端所见该场景当前生效版本（首次整定前为 0）"
+    )
+    multipliers: dict[str, PositiveFiniteFloat] = Field(
+        description="断路器 ID 到有限正倍率的映射；未列出者倍率为 1"
+    )
+
+    @model_validator(mode="after")
+    def _breaker_ids_nonempty(self) -> "ScenarioSettingIn":
+        bad = [bid for bid in self.multipliers if not bid]
+        if bad:
+            raise ValueError("断路器 id 不能为空字符串")
+        return self
+
+
+class SettingBatchIn(BaseModel):
+    """多场景整定发布请求：request_id + 至少两个场景项。"""
+
+    request_id: str = Field(min_length=1, description="客户端幂等键")
+    scenarios: list[ScenarioSettingIn] = Field(min_length=2)
+
+
+class ScenarioEffectiveSettingOut(BaseModel):
+    """单场景单次读取：版本与该版本生效倍率、核验严格同源，绝不混合版本。"""
+
+    scenario_id: str
+    revision: int = Field(description="当前（或指定）生效版本；从未被批次覆盖时为 0")
+    batch_id: str | None = Field(
+        default=None, description="产生该版本的批次 id；revision=0 时为 null"
+    )
+    multipliers: list[BreakerMultiplierOut] = Field(
+        description="该版本生效的非默认（k≠1）倍率，按断路器 ID 排序；其余倍率为 1"
+    )
+    verification: VerifyResponseOut = Field(
+        description="在上述倍率与版本下冻结的逐故障核验结果"
+    )
+
+
+class SettingBatchItemOut(BaseModel):
+    """批次内单个场景的生效版本、倍率与冻结核验。"""
+
+    scenario_id: str
+    expected_revision: int = Field(description="提交时客户端声明的期望版本")
+    from_revision: int = Field(description="该批次生效前的版本（= expected_revision）")
+    to_revision: int = Field(description="该批次生效后的新版本")
+    multipliers: list[BreakerMultiplierOut] = Field(
+        description="提交的全部倍率（按断路器 ID 排序，未列出者为 1）"
+    )
+    verification: VerifyResponseOut = Field(
+        description="该场景在本批次倍率下冻结的逐故障核验结果"
+    )
+
+
+class SettingBatchOut(BaseModel):
+    """不可变整定批次。"""
+
+    id: str
+    request_id: str
+    seq: int = Field(description="全局单调递增序号（按提交顺序）")
+    created_at: str
+    replayed: bool = Field(
+        description="本次响应是否为同 request_id + 同内容重试的回放"
+    )
+    scenarios: list[SettingBatchItemOut]
+
+
+class SettingBatchSummaryOut(BaseModel):
+    """批次摘要（列表用）。"""
+
+    id: str
+    request_id: str
+    seq: int
+    created_at: str
+    scenario_count: int
