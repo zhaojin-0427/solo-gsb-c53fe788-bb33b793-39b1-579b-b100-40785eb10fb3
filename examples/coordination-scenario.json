@@ -1,0 +1,34 @@
+{
+  "name": "coordination-demo",
+  "source": "S",
+  "branches": [
+    {"id": "B1", "from": "S", "to": "A", "breaker": {"id": "CB1", "curve_id": "C_UP"}},
+    {"id": "B2", "from": "A", "to": "B", "breaker": {"id": "CB2", "curve_id": "C_MAIN"}},
+    {"id": "B3", "from": "B", "to": "C"},
+    {"id": "B4", "from": "S", "to": "D"}
+  ],
+  "curves": [
+    {
+      "id": "C_MAIN",
+      "points": [
+        {"current": 10, "time": 10},
+        {"current": 100, "time": 1},
+        {"current": 1000, "time": 0.1}
+      ]
+    },
+    {
+      "id": "C_UP",
+      "points": [
+        {"current": 10, "time": 20},
+        {"current": 100, "time": 1.5},
+        {"current": 1000, "time": 0.12}
+      ]
+    }
+  ],
+  "faults": [
+    {"id": "F1", "branch_id": "B3", "current_min": 10, "current_max": 1000, "r": 1.8},
+    {"id": "F2", "branch_id": "B3", "current_min": 10, "current_max": 1000, "r": 1.1},
+    {"id": "F3", "branch_id": "B2", "current_min": 10, "current_max": 100, "r": 1.5},
+    {"id": "F4", "branch_id": "B1", "current_min": 10, "current_max": 1000, "r": 2.0}
+  ]
+}

@@ -1,0 +1,14 @@
+services:
+  api:
+    build: .
+    container_name: selectivity-api
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_PATH: /data/selectivity.db
+    volumes:
+      - selectivity-data:/data
+    restart: unless-stopped
+
+volumes:
+  selectivity-data:

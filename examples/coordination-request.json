@@ -1,0 +1,6 @@
+{
+  "adjustments": [
+    {"breaker_id": "CB1", "k_min": 0.5, "k_max": 2.0},
+    {"breaker_id": "CB2", "k_min": 0.5, "k_max": 2.0}
+  ]
+}
